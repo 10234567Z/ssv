@@ -181,7 +181,7 @@ func TestFieldPreservation(t *testing.T) {
 		assert.Equal(t, originalHash, unmarshaledHash, "Hash mismatch indicates fields weren't properly preserved in JSON")
 
 		// Store the expected hash - this will fail if a new field is added without updating the tests
-		expectedJSONHash := "c0e3d5bd93156b217c1e728490f2c38ebd845abb6657e923fd0d4c02553c3317"
+		expectedJSONHash := "a6d7d78c5e55f7239587e2261fc27dfb097045e7284286191202f6a3f6c8b605"
 		assert.Equal(t, expectedJSONHash, originalHash,
 			"Hash has changed. If you've added a new field, please update the expected hash in this test.")
 	})
