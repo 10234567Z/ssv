@@ -46,9 +46,7 @@ type SSV struct {
 	Forks                   SSVForks
 }
 
-type SSVForks struct {
-	Boole phase0.Epoch
-}
+type SSVForks struct {}
 
 func (s *SSV) String() string {
 	marshaled, err := json.Marshal(s)

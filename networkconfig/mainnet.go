@@ -1,7 +1,6 @@
 package networkconfig
 
 import (
-	"math"
 	"math/big"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -29,7 +28,5 @@ var MainnetSSV = &SSV{
 		"enr:-Li4QH7FwJcL8gJj0zHAITXqghMkG-A5bfWh2-3Q7vosy9D1BS8HZk-1ITuhK_rfzG3v_UtBDI6uNJZWpdcWfrQFCxKGAYnQ1DRCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLb3g2Jc2VjcDI1NmsxoQKeSDcZWSaY9FC723E9yYX1Li18bswhLNlxBZdLfgOKp4N0Y3CCE4mDdWRwgg-h",
 	},
 	TotalEthereumValidators: 1064860, // active_validators from https://mainnet.beaconcha.in/index/data on Apr 18, 2025
-	Forks: SSVForks{
-		Boole: math.MaxUint64,
-	},
+	Forks:                   SSVForks{},
 }

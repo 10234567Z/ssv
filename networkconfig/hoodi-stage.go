@@ -1,7 +1,6 @@
 package networkconfig
 
 import (
-	"math"
 	"math/big"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -18,7 +17,5 @@ var HoodiStageSSV = &SSV{
 		"enr:-Ja4QJZcaYfS0GpX-5xREVBa26a-E-QHMFek-EndsJdgM6loIM7pfbJwPDCNK1VzPkUhMjwcTTuNASiHU6X-sjsrxFmGAZWjNu06gmlkgnY0gmlwhErcGnyJc2VjcDI1NmsxoQP_bBE-ZYvaXKBR3dRYMN5K_lZP-q-YsBzDZEtxH_4T_YNzc3YBg3RjcIITioN1ZHCCD6I",
 	},
 	TotalEthereumValidators: HoodiSSV.TotalEthereumValidators,
-	Forks: SSVForks{
-		Boole: math.MaxUint64,
-	},
+	Forks:                   SSVForks{},
 }
