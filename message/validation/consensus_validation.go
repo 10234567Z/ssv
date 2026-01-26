@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	specqbft "github.com/ssvlabs/ssv-spec/qbft"
@@ -216,8 +217,8 @@ func (mv *messageValidator) validateQBFTLogic(
 				if len(signedSSVMessage.FullData) != 0 && signerState.HashedProposalData != nil {
 					if *signerState.HashedProposalData != consensusMessage.Root {
 						e := ErrDifferentProposalData
-						e.want = "0x" + hex.EncodeToString((*signerState.HashedProposalData)[:])
-						e.got = "0x" + hex.EncodeToString(consensusMessage.Root[:])
+						e.want = hexutil.Bytes((*signerState.HashedProposalData)[:]).String()
+						e.got = hexutil.Bytes(consensusMessage.Root[:]).String()
 						return e
 					}
 				}
