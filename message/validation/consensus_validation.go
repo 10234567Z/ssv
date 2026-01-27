@@ -237,8 +237,7 @@ func (mv *messageValidator) validateQBFTLogic(
 			// Rule: Decided msg can't have the same signers as previously sent before for the same duty
 			if signerState.SeenSigners != nil {
 				if _, ok := signerState.SeenSigners[quorum.ToBitMask()]; ok {
-					e := ErrDecidedWithSameSigners
-					return e
+					return ErrDecidedWithSameSigners
 				}
 			}
 		}
@@ -339,7 +338,8 @@ func (mv *messageValidator) processSignerState(
 	signerState *SignerState,
 ) error {
 	if len(signedSSVMessage.FullData) != 0 && consensusMessage.MsgType == specqbft.ProposalMsgType {
-		signerState.HashedProposalData = &consensusMessage.Root
+		rootCopy := consensusMessage.Root // optimization: allows GC to collect consensusMessage
+		signerState.HashedProposalData = &rootCopy
 	}
 
 	signerCount := len(signedSSVMessage.OperatorIDs)
