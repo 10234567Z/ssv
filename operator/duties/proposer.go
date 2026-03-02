@@ -21,15 +21,21 @@ import (
 type ProposerHandler struct {
 	baseHandler
 
-	duties       *dutystore.Duties[eth2apiv1.ProposerDuty]
-	fetchFirst   bool
+	duties *dutystore.Duties[eth2apiv1.ProposerDuty]
+
+	// fetchCurrentEpoch stores the intent to fetch duties for the current epoch, while
+	// processFetching func uses this value to decide on whether the fetch is needed.
+	fetchCurrentEpoch bool
+	// fetchNextEpoch stores the intent to fetch duties for the next epoch, while
+	// processFetching func uses this value to decide on whether the fetch is needed.
+	fetchNextEpoch bool
+
 	exporterMode bool
 }
 
 func NewProposerHandler(duties *dutystore.Duties[eth2apiv1.ProposerDuty], exporterMode bool) *ProposerHandler {
 	return &ProposerHandler{
 		duties:       duties,
-		fetchFirst:   true,
 		exporterMode: exporterMode,
 	}
 }
@@ -42,20 +48,23 @@ func (h *ProposerHandler) Name() string {
 //
 // On First Run:
 //  1. Fetch duties for the current epoch.
-//  2. Execute duties.
+//  2. If necessary, fetch duties for the next epoch.
+//  3. Execute duties.
 //
 // On Re-org (current dependent root changed):
 //  1. Fetch duties for the current epoch.
 //  2. Execute duties.
+//  3. If necessary, fetch duties for the next epoch.
 //
 // On Indices Change:
 //  1. Execute duties.
 //  2. ResetEpoch duties for the current epoch.
 //  3. Fetch duties for the current epoch.
+//  4. If necessary, fetch duties for the next epoch.
 //
 // On Ticker event:
 //  1. Execute duties.
-//  2. If necessary, fetch duties for the current epoch.
+//  2. If necessary, fetch duties for the next epoch.
 func (h *ProposerHandler) HandleDuties(ctx context.Context) {
 	h.logger.Info("starting duty handler")
 	defer h.logger.Info("duty handler exited")
@@ -77,25 +86,23 @@ func (h *ProposerHandler) HandleDuties(ctx context.Context) {
 				tickCtx, cancel := h.ctxWithDeadlineOnNextSlot(ctx, slot)
 				defer cancel()
 
-				if h.fetchFirst {
-					h.fetchFirst = false
-					h.indicesChanged = false
-					h.processFetching(tickCtx, currentEpoch)
-					h.processExecution(tickCtx, currentEpoch, slot)
-				} else {
-					h.processExecution(tickCtx, currentEpoch, slot)
-					if h.indicesChanged {
-						h.indicesChanged = false
-						h.processFetching(tickCtx, currentEpoch)
-					}
+				h.processExecution(tickCtx, currentEpoch, slot)
+
+				slotsPerEpoch := h.beaconConfig.SlotsPerEpoch
+
+				// If we have reached the mid-point of the epoch, fetch the duties for the next epoch in the next slot.
+				// This allows us to set them up at a time when the beacon node should be less busy.
+				if uint64(slot)%slotsPerEpoch == slotsPerEpoch/2-1 {
+					h.fetchNextEpoch = true
+				}
+
+				h.processFetching(tickCtx, currentEpoch, slot)
+
+				// last slot of epoch
+				if uint64(slot)%slotsPerEpoch == slotsPerEpoch-1 {
+					h.duties.ResetEpoch(currentEpoch - 1)
 				}
 			}()
-
-			// last slot of epoch
-			if uint64(slot)%h.beaconConfig.SlotsPerEpoch == h.beaconConfig.SlotsPerEpoch-1 {
-				h.duties.ResetEpoch(currentEpoch - 1)
-				h.fetchFirst = true
-			}
 
 		case reorgEvent := <-h.reorg:
 			currentEpoch := h.beaconConfig.EstimatedEpochAtSlot(reorgEvent.Slot)
@@ -105,7 +112,11 @@ func (h *ProposerHandler) HandleDuties(ctx context.Context) {
 			// reset current epoch duties
 			if reorgEvent.Current {
 				h.duties.ResetEpoch(currentEpoch)
-				h.fetchFirst = true
+				h.fetchCurrentEpoch = true
+				if h.shouldFetchNexEpoch(reorgEvent.Slot) {
+					h.duties.ResetEpoch(currentEpoch + 1)
+					h.fetchNextEpoch = true
+				}
 			}
 
 		case <-h.indicesChange:
@@ -114,36 +125,62 @@ func (h *ProposerHandler) HandleDuties(ctx context.Context) {
 			buildStr := fmt.Sprintf("e%v-s%v-#%v", currentEpoch, slot, slot%32+1)
 			h.logger.Info("🔁 indices change received", zap.String("epoch_slot_pos", buildStr))
 
-			h.indicesChanged = true
+			h.fetchCurrentEpoch = true
+
+			// reset next epoch duties if in appropriate slot range
+			if h.shouldFetchNexEpoch(slot) {
+				h.fetchNextEpoch = true
+			}
 		}
 	}
 }
 
-// HandleInitialDuties fetches duties for the current epoch.
+// HandleInitialDuties fetches duties for the current and next epochs.
+// Fetching duties for the next epoch is necessary if we are starting close to epoch-boundary because
+// our ticker might "miss" that rollover otherwise.
 func (h *ProposerHandler) HandleInitialDuties(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, h.beaconConfig.SlotDuration)
 	defer cancel()
 
-	epoch := h.beaconConfig.EstimatedCurrentEpoch()
-	h.processFetching(ctx, epoch)
+	h.fetchCurrentEpoch = true
+	h.fetchNextEpoch = true
+
+	slot := h.beaconConfig.EstimatedCurrentSlot()
+	epoch := h.beaconConfig.EstimatedEpochAtSlot(slot)
+	h.processFetching(ctx, epoch, slot)
 }
 
-func (h *ProposerHandler) processFetching(ctx context.Context, epoch phase0.Epoch) {
+func (h *ProposerHandler) processFetching(ctx context.Context, epoch phase0.Epoch, slot phase0.Slot) {
 	ctx, span := tracer.Start(ctx,
 		observability.InstrumentName(observabilityNamespace, "proposer.fetch"),
 		trace.WithAttributes(
 			observability.BeaconEpochAttribute(epoch),
+			observability.BeaconSlotAttribute(slot),
 			observability.BeaconRoleAttribute(spectypes.BNRoleProposer),
 		))
 	defer span.End()
 
-	span.AddEvent("fetching duties")
-	if err := h.fetchAndProcessDuties(ctx, epoch); err != nil {
-		// Set empty duties to inform DutyStore that fetch for this epoch is done.
-		h.duties.Set(epoch, []dutystore.StoreDuty[eth2apiv1.ProposerDuty]{})
-		h.logger.Error("failed to fetch duties for current epoch", zap.Error(err))
-		span.SetStatus(codes.Error, err.Error())
-		return
+	if h.fetchCurrentEpoch {
+		span.AddEvent("fetching current epoch duties")
+		if err := h.fetchAndProcessDuties(ctx, epoch); err != nil {
+			h.logger.Error("failed to fetch duties for current epoch", zap.Error(err))
+			span.SetStatus(codes.Error, err.Error())
+			return
+		}
+		h.fetchCurrentEpoch = false
+	}
+
+	// This additional shouldFetchNexEpoch check here is an optimization that prevents
+	// unnecessary(duplicate) fetches in some cases + also delays the fetch until we
+	// cannot delay it much further.
+	if h.fetchNextEpoch && h.shouldFetchNexEpoch(slot) {
+		span.AddEvent("fetching next epoch duties")
+		if err := h.fetchAndProcessDuties(ctx, epoch+1); err != nil {
+			h.logger.Error("failed to fetch duties for next epoch", zap.Error(err))
+			span.SetStatus(codes.Error, err.Error())
+			return
+		}
+		h.fetchNextEpoch = false
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -274,4 +311,9 @@ func (h *ProposerHandler) shouldExecute(duty *eth2apiv1.ProposerDuty) bool {
 		return true
 	}
 	return false
+}
+
+func (h *ProposerHandler) shouldFetchNexEpoch(slot phase0.Slot) bool {
+	slotsPerEpoch := h.beaconConfig.SlotsPerEpoch
+	return uint64(slot)%slotsPerEpoch > slotsPerEpoch/2-2
 }
