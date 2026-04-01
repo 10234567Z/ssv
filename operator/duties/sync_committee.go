@@ -27,12 +27,9 @@ type SyncCommitteeHandler struct {
 
 	duties *dutystore.SyncCommitteeDuties
 
-	// fetchCurrentPeriod stores the intent to fetch duties for the current period, while
-	// processFetching func uses this value to decide on whether the fetch is needed.
-	fetchCurrentPeriod bool
-	// fetchNextPeriod stores the intent to fetch duties for the next period, while
-	// processFetching func uses this value to decide on whether the fetch is needed.
-	fetchNextPeriod bool
+	// dutyFetchIntents stores the intents to fetch duties for some target periods, the bool indicates whether the
+	// intent has already been fulfilled.
+	dutyFetchIntents map[uint64]bool
 
 	// preparationSlots is the number of slots ahead of the sync committee
 	// period change at which to prepare the relevant duties.
@@ -46,8 +43,9 @@ type SyncCommitteeHandler struct {
 
 func NewSyncCommitteeHandler(duties *dutystore.SyncCommitteeDuties, exporterMode bool) *SyncCommitteeHandler {
 	h := &SyncCommitteeHandler{
-		duties:       duties,
-		exporterMode: exporterMode,
+		duties:           duties,
+		exporterMode:     exporterMode,
+		dutyFetchIntents: make(map[uint64]bool),
 	}
 	return h
 }
@@ -63,23 +61,21 @@ func (h *SyncCommitteeHandler) WaitShutdown() {
 // HandleDuties manages the duty lifecycle, handling different cases:
 //
 // On First Run:
-//  1. Fetch duties for the current period.
+//  1. If necessary, fetch duties for the current period.
 //  2. If necessary, fetch duties for the next period.
-//  3. Execute duties.
+//  3. Duties will be executed on the very next slot-tick.
 //
 // On Re-org:
-//  1. Execute duties.
-//  2. If necessary, fetch duties for the next period.
-//
-// On Indices Change:
-//  1. Execute duties.
-//  2. EraseEpochData duties for the current period.
-//  3. Fetch duties for the current period.
-//  4. If necessary, fetch duties for the next period.
+//  1. Declare intents to fetch duties for the periods affected by the reorg.
+//  2. If necessary, fetch duties for the next period so they can be processed on the next slot-tick.
+//  3. Duties will be executed on the very next slot-tick.
 //
 // On Ticker event:
-//  1. Execute duties.
-//  2. If necessary, fetch duties for the next period.
+//  1. If necessary, fetch duties for the current period.
+//  2. Execute duties.
+//  3. If necessary, fetch duties for the next period.
+//  4. If necessary, process validator-indices changes by declaring the intents to fetch duties for the periods
+//     affected by it, also potentially pre-fetching duties so they are ready for processing on the next slot-tick.
 func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 	h.logger.Info("starting duty handler")
 	defer h.logger.Info("duty handler exited")
@@ -92,13 +88,21 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 
 		case <-next:
 			currentSlot := h.ticker.Slot()
-			next = h.ticker.Next()
+			next = h.ticker.Next() // advances h.ticker
 			currentEpoch := h.beaconConfig.EstimatedEpochAtSlot(currentSlot)
 			currentPeriod := h.beaconConfig.EstimatedSyncCommitteePeriodAtEpoch(currentEpoch)
+			nextPeriod := currentPeriod + 1
 
 			slotNumber := uint64(currentSlot)%h.beaconConfig.SlotsPerEpoch + 1
 			buildStr := fmt.Sprintf("p%v-e%v-s%v-#%v", currentPeriod, currentEpoch, currentSlot, slotNumber)
-			h.logger.Debug("🛠 ticker event", zap.String("period_epoch_slot_pos", buildStr))
+			logger := h.logger.With(
+				zap.String("period_epoch_slot_pos", buildStr),
+				zap.Uint64("current_period", currentPeriod),
+				zap.Uint64("current_epoch", uint64(currentEpoch)),
+				zap.Uint64("current_slot", uint64(currentSlot)),
+			)
+
+			logger.Debug("🛠 ticker event")
 
 			func() {
 				// tickCtx ensures we never take too long to process ticks (otherwise we might not be able to catch up
@@ -107,51 +111,86 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 				tickCtx, cancel := context.WithDeadline(ctx, h.beaconConfig.SlotStartTime(currentSlot+1))
 				defer cancel()
 
+				// 1. Process the duty execution & fetching.
+				h.prepareCurrentPeriod(tickCtx, logger, currentEpoch, currentPeriod, currentSlot, true)
 				h.processExecution(tickCtx, currentPeriod, currentSlot)
-				h.processFetching(tickCtx, currentEpoch, currentPeriod, true)
+				h.prepareNextPeriod(tickCtx, logger, currentEpoch, currentPeriod, currentSlot, true)
+
+				if currentSlot == h.beaconConfig.LastSlotOfSyncPeriod(currentPeriod) && currentPeriod >= 1 {
+					h.duties.Reset(currentPeriod - 1)
+					delete(h.dutyFetchIntents, currentPeriod-1)
+				}
+
+				// 2. Process validator indices changes (if any). We want to process it on the current slot only
+				// if we are still early into the slot (1 slot-interval is just a guesstimate), otherwise we might
+				// be delaying the next tick (the duties that need to be executed on the next slot).
+				indicesChangeDeadline := h.beaconConfig.SlotStartTime(currentSlot).Add(h.beaconConfig.IntervalDuration())
+				select {
+				case <-h.indicesChange:
+					logger.Info("🔁 indices change received")
+
+					// 1) Declare intents.
+					h.dutyFetchIntents[currentPeriod] = false
+					h.dutyFetchIntents[nextPeriod] = false
+
+					// 2) Process certain intents immediately.
+					if currentSlot == h.beaconConfig.LastSlotOfSyncPeriod(currentPeriod) {
+						delete(h.dutyFetchIntents, currentPeriod) // optimization: prune irrelevant intent
+						h.prepareNextPeriod(tickCtx, logger, currentEpoch, currentPeriod, currentSlot, true)
+					} else {
+						h.prepareCurrentPeriod(tickCtx, logger, currentEpoch, currentPeriod, currentSlot, true)
+					}
+				case <-time.After(time.Until(indicesChangeDeadline)):
+					// It's too late(risky) to handle indices change on the current slot, we'll do it on the next slot.
+				case <-tickCtx.Done():
+					return
+				}
+
+				// 3. Schedule the duty-fetch for the next period, but only if it hasn't been scheduled already (also,
+				// already fulfilled intents need not be re-scheduled).
+				if _, ok := h.dutyFetchIntents[nextPeriod]; !ok {
+					h.dutyFetchIntents[nextPeriod] = false
+				}
 			}()
-
-			// if we have reached the preparation slots -1, prepare the next period duties in the next slot.
-			periodSlots := h.slotsPerPeriod()
-			if uint64(currentSlot)%periodSlots == periodSlots-h.preparationSlots-1 {
-				h.fetchNextPeriod = true
-			}
-
-			// last slot of period
-			if currentSlot == h.beaconConfig.LastSlotOfSyncPeriod(currentPeriod) {
-				h.duties.Reset(currentPeriod - 1)
-			}
 
 		case reorgEvent := <-h.reorg:
 			currentSlot := h.beaconConfig.EstimatedCurrentSlot()
 			currentEpoch := h.beaconConfig.EstimatedEpochAtSlot(currentSlot)
 			currentPeriod := h.beaconConfig.EstimatedSyncCommitteePeriodAtEpoch(currentEpoch)
+			nextPeriod := currentPeriod + 1
 
 			slotNumber := uint64(currentSlot)%h.beaconConfig.SlotsPerEpoch + 1
 			buildStr := fmt.Sprintf("p%v-e%v-s%v-#%v", currentPeriod, currentEpoch, currentSlot, slotNumber)
-			h.logger.Info("🔀 reorg event received", zap.String("period_epoch_slot_pos", buildStr), zap.Any("event", reorgEvent))
+			logger := h.logger.With(
+				zap.String("period_epoch_slot_pos", buildStr),
+				zap.Uint64("current_period", currentPeriod),
+				zap.Uint64("current_epoch", uint64(currentEpoch)),
+				zap.Uint64("current_slot", uint64(currentSlot)),
+			)
 
-			// reset current epoch duties
-			if reorgEvent.Current && h.shouldFetchNextPeriod(currentSlot) {
-				h.duties.Reset(currentPeriod + 1)
-				h.fetchNextPeriod = true
-			}
+			logger.Info("🔀 reorg event received",
+				zap.Any("event", reorgEvent),
+				zap.Bool("refetch_next_period_duties", reorgEvent.Current),
+			)
 
-		case <-h.indicesChange:
-			currentSlot := h.beaconConfig.EstimatedCurrentSlot()
-			currentEpoch := h.beaconConfig.EstimatedEpochAtSlot(currentSlot)
-			currentPeriod := h.beaconConfig.EstimatedSyncCommitteePeriodAtEpoch(currentEpoch)
+			func() {
+				// reorgCtx ensures we never take too long to process the reorg (we don't want to prevent the
+				// slot-ticker from executing duties even if some of them might not be up to date). Since the
+				// reorg can happen closer to the end of the current slot we wouldn't want to set the deadline
+				// to currentSlot+1 as that might be too short (hence setting it to currentSlot+2).
+				reorgCtx, cancel := context.WithDeadline(ctx, h.beaconConfig.SlotStartTime(currentSlot+2))
+				defer cancel()
 
-			slotNumber := uint64(currentSlot)%h.beaconConfig.SlotsPerEpoch + 1
-			buildStr := fmt.Sprintf("p%v-e%v-s%v-#%v", currentPeriod, currentEpoch, currentSlot, slotNumber)
-			h.logger.Info("🔁 indices change received", zap.String("period_epoch_slot_pos", buildStr))
+				// 1) Declare intents.
+				if reorgEvent.Current {
+					h.dutyFetchIntents[nextPeriod] = false
+				}
 
-			h.fetchCurrentPeriod = true
-
-			// reset next period duties if in appropriate slot range
-			if h.shouldFetchNextPeriod(currentSlot) {
-				h.fetchNextPeriod = true
-			}
+				// 2) Process certain intents immediately.
+				if reorgEvent.Current {
+					h.prepareNextPeriod(reorgCtx, logger, currentEpoch, currentPeriod, currentSlot, true)
+				}
+			}()
 		}
 	}
 }
@@ -160,55 +199,84 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 // Fetching duties for the next period is necessary if we are starting close to epoch-boundary because
 // our ticker might "miss" that rollover otherwise.
 func (h *SyncCommitteeHandler) HandleInitialDuties(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, h.beaconConfig.SlotDuration)
+	initCtx, cancel := context.WithTimeout(ctx, h.beaconConfig.SlotDuration)
 	defer cancel()
-
-	h.fetchCurrentPeriod = true
 
 	// Prepare relevant duties 1.5 epochs (48 slots) ahead of the sync committee period change.
 	// The 1.5 epochs timing helps ensure setup occurs when the beacon node is likely less busy.
 	h.preparationSlots = h.beaconConfig.SlotsPerEpoch * 3 / 2
 
-	if h.shouldFetchNextPeriod(h.beaconConfig.EstimatedCurrentSlot()) {
-		h.fetchNextPeriod = true
-	}
-
-	currentEpoch := h.beaconConfig.EstimatedCurrentEpoch()
+	currentSlot := h.beaconConfig.EstimatedCurrentSlot()
+	currentEpoch := h.beaconConfig.EstimatedEpochAtSlot(currentSlot)
 	currentPeriod := h.beaconConfig.EstimatedSyncCommitteePeriodAtEpoch(currentEpoch)
-	h.processFetching(ctx, currentEpoch, currentPeriod, false)
+	nextPeriod := currentPeriod + 1
+
+	slotNumber := uint64(currentSlot)%h.beaconConfig.SlotsPerEpoch + 1
+	buildStr := fmt.Sprintf("p%v-e%v-s%v-#%v", currentPeriod, currentEpoch, currentSlot, slotNumber)
+	logger := h.logger.With(
+		zap.String("period_epoch_slot_pos", buildStr),
+		zap.Uint64("current_period", currentPeriod),
+		zap.Uint64("current_epoch", uint64(currentEpoch)),
+		zap.Uint64("current_slot", uint64(currentSlot)),
+	)
+
+	// 1) Declare intents.
+	h.dutyFetchIntents[currentPeriod] = false
+	h.dutyFetchIntents[nextPeriod] = false
+
+	// 2) Process certain intents immediately.
+	if currentSlot == h.beaconConfig.LastSlotOfSyncPeriod(currentPeriod) {
+		delete(h.dutyFetchIntents, currentPeriod) // optimization: prune irrelevant intent
+		h.prepareNextPeriod(initCtx, logger, currentEpoch, currentPeriod, currentSlot, false)
+	} else {
+		h.prepareCurrentPeriod(initCtx, logger, currentEpoch, currentPeriod, currentSlot, false)
+		h.prepareNextPeriod(initCtx, logger, currentEpoch, currentPeriod, currentSlot, false)
+	}
 }
 
-func (h *SyncCommitteeHandler) processFetching(ctx context.Context, epoch phase0.Epoch, period uint64, waitForInitial bool) {
-	ctx, span := tracer.Start(ctx,
-		observability.InstrumentName(observabilityNamespace, "sync_committee_contribution.fetch"),
-		trace.WithAttributes(
-			observability.BeaconEpochAttribute(epoch),
-			observability.BeaconPeriodAttribute(period),
-			observability.BeaconRoleAttribute(spectypes.BNRoleSyncCommitteeContribution),
-		))
-	defer span.End()
+func (h *SyncCommitteeHandler) prepareCurrentPeriod(
+	ctx context.Context,
+	logger *zap.Logger,
+	currentEpoch phase0.Epoch,
+	currentPeriod uint64,
+	currentSlot phase0.Slot,
+	waitForInitial bool,
+) {
+	if fulfilled, ok := h.dutyFetchIntents[currentPeriod]; ok && !fulfilled {
+		logger.Debug("fetching duties for the current period")
 
-	if h.fetchCurrentPeriod {
-		span.AddEvent("fetching current period duties")
-		if err := h.fetchAndProcessDuties(ctx, epoch, period, waitForInitial); err != nil {
-			h.logger.Error("failed to fetch duties for current period", zap.Error(err))
-			span.SetStatus(codes.Error, err.Error())
+		err := h.fetchAndProcessDuties(ctx, logger, currentEpoch, currentPeriod, currentSlot, waitForInitial)
+		if err != nil {
+			logger.Error("fetching duties for the current period failed", zap.Error(err))
 			return
 		}
-		h.fetchCurrentPeriod = false
-	}
+		h.dutyFetchIntents[currentPeriod] = true
 
-	if h.fetchNextPeriod {
-		span.AddEvent("fetching next period duties")
-		if err := h.fetchAndProcessDuties(ctx, epoch, period+1, waitForInitial); err != nil {
-			h.logger.Error("failed to fetch duties for next period", zap.Error(err))
-			span.SetStatus(codes.Error, err.Error())
+		logger.Debug("fetching duties for the current period succeeded")
+	}
+}
+
+func (h *SyncCommitteeHandler) prepareNextPeriod(
+	ctx context.Context,
+	logger *zap.Logger,
+	currentEpoch phase0.Epoch,
+	currentPeriod uint64,
+	currentSlot phase0.Slot,
+	waitForInitial bool,
+) {
+	// Delaying the duty fetch until it's a "good time" allows us to do it when the beacon node should be less busy.
+	if fulfilled, ok := h.dutyFetchIntents[currentPeriod+1]; ok && !fulfilled && h.shouldFetchNextPeriod(currentSlot) {
+		logger.Debug("fetching duties for the next period")
+
+		err := h.fetchAndProcessDuties(ctx, logger, currentEpoch, currentPeriod+1, currentSlot, waitForInitial)
+		if err != nil {
+			logger.Error("fetching duties for the next period failed", zap.Error(err))
 			return
 		}
-		h.fetchNextPeriod = false
-	}
+		h.dutyFetchIntents[currentPeriod+1] = true
 
-	span.SetStatus(codes.Ok, "")
+		logger.Debug("fetching duties for the next period succeeded")
+	}
 }
 
 func (h *SyncCommitteeHandler) processExecution(ctx context.Context, period uint64, slot phase0.Slot) {
@@ -254,12 +322,20 @@ func (h *SyncCommitteeHandler) processExecution(ctx context.Context, period uint
 // If the period passed is the current period – the sync committee target epoch should be the current epoch.
 // If the period passed is a future period – the sync committee target epoch should be the first epoch of that future period.
 // The epoch passed is always the current epoch.
-func (h *SyncCommitteeHandler) fetchAndProcessDuties(ctx context.Context, epoch phase0.Epoch, period uint64, waitForInitial bool) error {
+func (h *SyncCommitteeHandler) fetchAndProcessDuties(
+	ctx context.Context,
+	logger *zap.Logger,
+	epoch phase0.Epoch,
+	period uint64,
+	currentSlot phase0.Slot,
+	waitForInitial bool,
+) error {
 	start := time.Now()
 	ctx, span := tracer.Start(ctx,
 		observability.InstrumentName(observabilityNamespace, "sync_committee.fetch_and_store"),
 		trace.WithAttributes(
 			observability.BeaconEpochAttribute(epoch),
+			observability.BeaconSlotAttribute(currentSlot),
 			observability.BeaconPeriodAttribute(period),
 			observability.BeaconRoleAttribute(spectypes.BNRoleSyncCommittee),
 		))
@@ -270,6 +346,10 @@ func (h *SyncCommitteeHandler) fetchAndProcessDuties(ctx context.Context, epoch 
 	}
 
 	span.SetAttributes(observability.BeaconEpochAttribute(epoch))
+	logger = logger.With(
+		zap.Uint64("target_period", period),
+		zap.Uint64("target_epoch", uint64(epoch)),
+	)
 
 	eligibleIndices := h.validatorController.FilterIndices(waitForInitial, func(s *types.SSVShare) bool {
 		return s.IsParticipating(h.beaconConfig, epoch)
@@ -277,7 +357,7 @@ func (h *SyncCommitteeHandler) fetchAndProcessDuties(ctx context.Context, epoch 
 
 	if len(eligibleIndices) == 0 {
 		const eventMsg = "no eligible validators for period"
-		h.logger.Debug(eventMsg, fields.Epoch(epoch), zap.Uint64("period", period))
+		logger.Debug(eventMsg)
 		span.AddEvent(eventMsg)
 		span.SetStatus(codes.Ok, "")
 		return nil
@@ -309,7 +389,7 @@ func (h *SyncCommitteeHandler) fetchAndProcessDuties(ctx context.Context, epoch 
 	span.AddEvent("storing duties", trace.WithAttributes(observability.DutyCountAttribute(len(storeDuties))))
 	h.duties.Set(period, storeDuties)
 
-	h.prepareDutiesResultLog(period, duties, start)
+	h.prepareDutiesResultLog(logger, period, duties, start)
 
 	// Further processing is not needed in exporter mode, terminate early
 	// avoiding CL subscriptions saves some CPU & Network resources
@@ -351,7 +431,12 @@ func (h *SyncCommitteeHandler) fetchAndProcessDuties(ctx context.Context, epoch 
 	return nil
 }
 
-func (h *SyncCommitteeHandler) prepareDutiesResultLog(period uint64, duties []*eth2apiv1.SyncCommitteeDuty, start time.Time) {
+func (h *SyncCommitteeHandler) prepareDutiesResultLog(
+	logger *zap.Logger,
+	period uint64,
+	duties []*eth2apiv1.SyncCommitteeDuty,
+	start time.Time,
+) {
 	var b strings.Builder
 	if h.exporterMode {
 		// too many duties to log individually
@@ -365,7 +450,7 @@ func (h *SyncCommitteeHandler) prepareDutiesResultLog(period uint64, duties []*e
 			b.WriteString(tmp)
 		}
 	}
-	h.logger.Debug("👥 got duties",
+	logger.Debug("👥 got duties",
 		fields.Count(len(duties)),
 		zap.String("period", fmt.Sprintf("p%v", period)),
 		zap.Any("duties", b.String()),

@@ -279,7 +279,7 @@ func TestScheduler_SyncCommittee_Indices_Changed(t *testing.T) {
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-2))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 2))
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
+		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
 		// STEP 4: no action should be taken
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-1))
@@ -427,12 +427,12 @@ func TestScheduler_SyncCommittee_Reorg_Current(t *testing.T) {
 			},
 		})
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
-		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 
-		// STEP 5: wait for sync committee duties to be re-fetched for the current epoch
+		// STEP 5: wait for no action to be taken
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-1))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 1))
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
+		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
 		// STEP 6: The first assigned duty should not be executed, but the second one should
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch))
@@ -508,7 +508,7 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 			},
 		})
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
-		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 
 		// STEP 3: trigger a change in active indices
 		scheduler.indicesChg <- struct{}{}
@@ -519,11 +519,11 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		}))
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 5: wait for sync committee duties to be re-fetched for the current epoch
+		// STEP 5: wait for sync committee duties to be re-fetched for the current period
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-1))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 1))
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
+		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
 		// STEP 6: The first assigned duty should not be executed, but the second and the new from indices change should
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch))
@@ -532,6 +532,7 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		setExecuteDutyFunc(scheduler, executeDutiesCall, len(expected))
 
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod * testSlotsPerEpoch))
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesExecution(t, fetchDutiesCall, executeDutiesCall, timeout, expected)
 
 		// Stop scheduler & wait for graceful exit.
