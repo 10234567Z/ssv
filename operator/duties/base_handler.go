@@ -100,3 +100,7 @@ func (h *baseHandler) atLastSlotOfCurrentEpoch(currentSlot phase0.Slot) bool {
 	slotsPerEpoch := h.beaconConfig.SlotsPerEpoch
 	return uint64(currentSlot+1)%slotsPerEpoch == 0
 }
+
+func (h *baseHandler) atLastSlotOfCurrentPeriod(currentSlot phase0.Slot, currentPeriod uint64) bool {
+	return currentSlot == h.beaconConfig.LastSlotOfSyncPeriod(currentPeriod)
+}
