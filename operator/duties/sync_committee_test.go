@@ -260,10 +260,9 @@ func TestScheduler_SyncCommittee_Indices_Changed(t *testing.T) {
 			},
 		})
 
-		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current and next periods
+		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current period only
 		waitForDuties.Set(true)
 		require.NoError(t, scheduler.Start(ctx))
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 
 		// STEP 2: trigger a change in active indices
@@ -275,9 +274,11 @@ func TestScheduler_SyncCommittee_Indices_Changed(t *testing.T) {
 		}))
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 3: wait for sync committee duties to be re-fetched
+		// STEP 3: wait for sync committee duties to be re-fetched twice:
+		// once for the regular next-period prefetch and once while handling the indices change.
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-2))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 2))
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
@@ -392,10 +393,9 @@ func TestScheduler_SyncCommittee_Reorg_Current(t *testing.T) {
 			},
 		})
 
-		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current and next periods
+		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current period only
 		waitForDuties.Set(true)
 		require.NoError(t, scheduler.Start(ctx))
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 
 		// STEP 2: trigger head event
@@ -408,12 +408,13 @@ func TestScheduler_SyncCommittee_Reorg_Current(t *testing.T) {
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 3: Ticker with no action
+		// STEP 3: ticker pre-fetches duties for the next period
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-2))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 2))
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 4: trigger reorg
+		// STEP 4: trigger reorg, the current slot re-fetches duties for the next period
 		e = &v1.Event{
 			Data: &v1.HeadEvent{
 				Slot:                     testEpochsPerSCPeriod*testSlotsPerEpoch - 2,
@@ -428,6 +429,7 @@ func TestScheduler_SyncCommittee_Reorg_Current(t *testing.T) {
 		})
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
+		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
 		// STEP 5: wait for no action to be taken
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-1))
@@ -473,10 +475,9 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 			},
 		})
 
-		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current and next periods
+		// STEP 1: (on startup) wait for sync committee duties to be fetched for the current period only
 		waitForDuties.Set(true)
 		require.NoError(t, scheduler.Start(ctx))
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 
 		// STEP 2: trigger head event
@@ -489,12 +490,13 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 3: Ticker with no action
+		// STEP 3: ticker pre-fetches duties for the next period
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-2))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 2))
+		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 4: trigger reorg
+		// STEP 4: trigger reorg, the current slot re-fetches duties for the next period
 		e = &v1.Event{
 			Data: &v1.HeadEvent{
 				Slot:                     testEpochsPerSCPeriod*testSlotsPerEpoch - 2,
@@ -509,8 +511,9 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		})
 		scheduler.HandleHeadEvent()(t.Context(), e.Data.(*v1.HeadEvent))
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
+		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 3: trigger a change in active indices
+		// STEP 5: trigger a change in active indices in the same slot
 		scheduler.indicesChg <- struct{}{}
 		duties, _ := dutiesMap.Get(1)
 		dutiesMap.Set(1, append(duties, &v1.SyncCommitteeDuty{
@@ -519,13 +522,14 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		}))
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 5: wait for sync committee duties to be re-fetched for the current period
+		// STEP 6: the boundary tick re-fetches duties for the next period due to the indices change.
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch-1))
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch - 1))
 		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
-		// STEP 6: The first assigned duty should not be executed, but the second and the new from indices change should
+		// STEP 7: The first assigned duty should not be executed, but the second and the new from indices change should.
+		// On entering the new period, duties are fetched for the current period before execution.
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch))
 		duties, _ = dutiesMap.Get(1)
 		expected := expectedExecutedSyncCommitteeDuties(handler, duties, testEpochsPerSCPeriod*testSlotsPerEpoch)
