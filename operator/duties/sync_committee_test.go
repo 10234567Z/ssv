@@ -564,14 +564,14 @@ func TestScheduler_SyncCommittee_Reorg_Current_Indices_Changed(t *testing.T) {
 		waitForNoAction(t, fetchDutiesCall, executeDutiesCall, noActionTimeout)
 
 		// STEP 7: The first assigned duty should not be executed, but the second and the new from indices change should.
-		// On entering the new period, duties are fetched for the current period before execution.
+		// With the period-boundary check applying on slot 46+, the indices change at slot 47 already refreshed p1,
+		// so entering the new period executes without an additional fetch.
 		waitForSlotN(scheduler.beaconConfig, phase0.Slot(testEpochsPerSCPeriod*testSlotsPerEpoch))
 		duties, _ = dutiesMap.Get(1)
 		expected := expectedExecutedSyncCommitteeDuties(handler, duties, testEpochsPerSCPeriod*testSlotsPerEpoch)
 		setExecuteDutyFunc(scheduler, executeDutiesCall, len(expected))
 
 		ticker.Send(phase0.Slot(testEpochsPerSCPeriod * testSlotsPerEpoch))
-		waitForDutiesFetch(t, fetchDutiesCall, timeout)
 		waitForDutiesExecution(t, fetchDutiesCall, executeDutiesCall, timeout, expected)
 
 		// Stop scheduler & wait for graceful exit.

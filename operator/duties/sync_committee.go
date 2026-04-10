@@ -146,7 +146,7 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 					// When at period boundary, we only care about pre-fetching & preparing the duties for the next
 					// period (the current period will have been passed upon the next slot-tick). Otherwise, pre-fetch &
 					// prepare the duties for the current period.
-					if h.atLastSlotOfCurrentPeriod(currentSlot, currentPeriod) {
+					if h.atLastSlotOrPastCurrentPeriod(currentSlot, currentPeriod) {
 						delete(h.dutyFetchIntents, currentPeriod) // optimization: prune irrelevant intent
 						h.prepareNextPeriod(tickCtx, logger, currentPeriod, currentEpoch, currentSlot, true)
 					} else {
@@ -204,7 +204,7 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 				// pre-fetch & prepare the duties for the current period immediately since those might have been
 				// affected by this reorg (the next tick(s) will take care of the pre-fetch & prepare for the next
 				// period, if it was also affected by this reorg).
-				if h.atLastSlotOfCurrentPeriod(currentSlot, currentPeriod) {
+				if h.atLastSlotOrPastCurrentPeriod(currentSlot, currentPeriod) {
 					delete(h.dutyFetchIntents, currentPeriod) // optimization: prune irrelevant intent
 					h.prepareNextPeriod(reorgCtx, logger, currentPeriod, currentEpoch, currentSlot, true)
 				} else {
@@ -249,7 +249,7 @@ func (h *SyncCommitteeHandler) HandleInitialDuties(ctx context.Context) {
 	// have enough time to process those duties anyway ... but we do want to fetch the duties for the next period
 	// right away in that case since we'll need to be able to execute those duties on the next tick - the tick
 	// corresponding to the 1st slot of the next period.
-	if h.atLastSlotOfCurrentPeriod(currentSlot, currentPeriod) {
+	if h.atLastSlotOrPastCurrentPeriod(currentSlot, currentPeriod) {
 		delete(h.dutyFetchIntents, currentPeriod) // optimization: prune irrelevant intent
 		h.prepareNextPeriod(initCtx, logger, currentPeriod, currentEpoch, currentSlot, false)
 	} else {
