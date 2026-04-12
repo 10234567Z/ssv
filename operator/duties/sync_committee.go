@@ -122,6 +122,8 @@ func (h *SyncCommitteeHandler) HandleDuties(ctx context.Context) {
 				// Process intents (if any): fetch & prepare the duties for the next period.
 				h.prepareNextPeriod(tickCtx, logger, currentPeriod, currentEpoch, currentSlot, true)
 
+				// Clean up the irrelevant data to prevent infinite memory growth at the very 1st slot of the epoch.
+				// Note, it doesn't have to be "the very 1st slot" exactly - it's just the most natural time to do it.
 				if slotNumber == 1 && currentPeriod >= 1 {
 					h.duties.Reset(currentPeriod - 1)
 					delete(h.dutyFetchIntents, currentPeriod-1)
